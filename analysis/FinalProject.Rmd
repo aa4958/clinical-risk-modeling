@@ -1,0 +1,208 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(ROCR)
+library(pROC)
+library(corrplot)
+library(janitor)
+
+set.seed(123)
+```
+```{r}
+getwd()
+```
+#Load the data
+```{r}
+heart <- read.table("processed.cleveland.data", 
+                    sep = ",",
+                    header = FALSE,
+                    na.strings = "?")
+```
+
+#Give data column names
+```{r}
+colnames(heart) <- c(
+  "age", "sex", "cp", "trestbps", "chol",
+  "fbs", "restecg", "thalach", "exang",
+  "oldpeak", "slope", "ca", "thal", "num"
+)
+```
+
+#Convert target variable to binary
+```{r}
+heart <- heart %>%
+  mutate(
+    disease = ifelse(num > 0, 1, 0),
+    disease = factor(disease)
+  )
+```
+
+#Drop multi-class col
+```{r}
+heart$num <- NULL
+```
+
+```{r}
+glimpse(heart)
+colSums(is.na(heart))
+```
+
+
+#Median imputation for numeric
+#Mode for categorical
+```{r}
+for (col in names(heart)) {
+  if (is.numeric(heart[[col]])) {
+    heart[[col]][is.na(heart[[col]])] <- median(heart[[col]], na.rm = TRUE)
+  } else {
+    heart[[col]][is.na(heart[[col]])] <- names(which.max(table(heart[[col]])))
+  }
+}
+```
+
+#Summary Stats
+```{r}
+summary(heart)
+```
+#Histogram of numeric colums
+```{r}
+heart %>%
+  select(age, trestbps, chol, thalach, oldpeak) %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = "steelblue") +
+  facet_wrap(~ key, scales = "free") +
+  theme_minimal()
+```
+
+#Correlation plot
+```{r}
+numeric_vars <- heart %>% select_if(is.numeric)
+corrplot(cor(numeric_vars), method = "color")
+```
+
+```{r}
+heart <- heart %>%
+  mutate(
+    chol_log = log(chol),
+    oldpeak_log = log(oldpeak + 1)  # avoid log(0)
+  )
+
+#Check transformed distributions
+ggplot(heart, aes(chol_log)) + geom_histogram(bins = 30, fill = "darkgreen")
+ggplot(heart, aes(oldpeak_log)) + geom_histogram(bins = 30, fill = "darkred")
+```
+
+
+```{r}
+train_index <- createDataPartition(heart$disease, p = 0.8, list = FALSE)
+train <- heart[train_index, ]
+test  <- heart[-train_index, ]
+```
+
+```{r}
+log_model <- glm(disease ~ age + sex + cp + trestbps + chol_log +
+                   thalach + exang + oldpeak_log + slope + ca + thal,
+                 data = train,
+                 family = binomial)
+
+summary(log_model)
+```
+
+```{r}
+exp(cbind(OR = coef(log_model), confint(log_model)))
+
+#Predictions on test set
+log_prob <- predict(log_model, test, type = "response")
+log_pred <- ifelse(log_prob > 0.5, 1, 0)
+
+#Confusion matrix
+confusionMatrix(factor(log_pred), test$disease)
+
+#ROC curve & AUC
+roc_obj <- roc(test$disease, log_prob)
+plot(roc_obj, col = "red", main = "ROC Curve – Logistic Regression")
+auc(roc_obj)
+```
+
+```{r}
+tree_model <- rpart(disease ~ age + sex + cp + trestbps + chol_log +
+                      thalach + exang + oldpeak_log + slope + ca + thal,
+                    data = train,
+                    method = "class",
+                    cp = 0.01)
+
+#Visualize tree
+rpart.plot(tree_model, type = 2, extra = 106)
+
+#Predictions & evaluation
+tree_pred <- predict(tree_model, test, type = "class")
+confusionMatrix(tree_pred, test$disease)
+
+#ROC & AUC for tree
+tree_prob <- predict(tree_model, test)[, 2]
+roc_tree <- roc(test$disease, tree_prob)
+plot(roc_tree, col = "blue", main = "ROC Curve – Decision Tree")
+auc(roc_tree)
+```
+
+```{r}
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+heart$disease <- factor(heart$disease, levels = c(0, 1), labels = c("No", "Yes"))
+
+# Check levels
+levels(heart$disease)
+```
+
+```{r}
+cv_log_model <- train(
+  disease ~ age + sex + cp + trestbps + chol_log +
+    thalach + exang + oldpeak_log + slope + ca + thal,
+  data = heart,
+  method = "glm",
+  family = binomial,
+  metric = "ROC",
+  trControl = train_control
+)
+
+cv_log_model
+```
+
+
+```{r}
+varImp(cv_log_model) %>%
+  ggplot(aes(x = Overall, y = reorder(rownames(.), Overall))) +
+  geom_col(fill = "darkred") +
+  labs(title = "Feature Importance – Logistic Regression")
+```
+
+```{r}
+results <- data.frame(
+  Model = c("Logistic Regression", "Decision Tree"),
+  Accuracy = c(
+    confusionMatrix(factor(log_pred), factor(test$disease))$overall["Accuracy"],
+    confusionMatrix(tree_pred, test$disease)$overall["Accuracy"]
+  ),
+  AUC = c(
+    auc(roc_obj),
+    auc(roc_tree)
+  )
+)
+
+results
+```
